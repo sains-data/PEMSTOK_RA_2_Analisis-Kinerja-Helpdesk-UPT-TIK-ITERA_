@@ -1,0 +1,283 @@
+---
+title: "Analisis Kinerja Helpdesk UPT TIK"
+author: "Kelompok 2 RA"
+format: pdf
+documentclass: article  
+editor: source
+markdown: 
+  wrap: 72
+---
+
+## 1. Pendahuluan
+
+### 1.1. Konteks Penelitian
+
+Proyek ini menganalisis kinerja sistem antrean dari 5 layanan utama di Helpdesk UPT TIK.
+
+### 1.2. Tantangan Metodologi (Batas Statistik)
+
+Analisis antrean standar (seperti M/M/1 atau M/M/c) memerlukan asumsi kuat tentang jumlah server ($s$) dan distribusi layanan ($\mu$).
+
+Informasi baru dari staf UPT TIK mengungkap bahwa:
+
+1\. Tiket "general" ditangani oleh $s=2$ (dua staf).
+
+2\. Tiket "sulit" atau "spesifik" dialihkan ke $s=1$ (spesialis).
+
+Data kita (E-Learning, SSO, dll.) kemungkinan merupakan campuran dari kedua sistem ini. Kita tidak tahu pasti layanan mana yang memiliki $s=1$ atau $s=2$.
+
+**Pelanggaran Statistik yang Harus Dihindari:** Mengasumsikan $s=1$ (model M/M/1) untuk semua layanan **terbukti salah** dan akan menghasilkan kesimpulan yang tidak valid.
+
+### 1.3. Solusi: Analisis Observasional
+
+Untuk menghormati batas statistik, kami akan menggunakan metodologi yang 100% faktual dan bebas asumsi model. Kami hanya akan menghitung metrik yang dapat diobservasi secara langsung dari data.
+
+-   **Apa yang Kita Hitung:**
+    1.  $\lambda$ (Tingkat Kedatangan): Fakta dari data `waktu_mulai`.
+    2.  $W_s$ (Waktu Sistem Total): Fakta dari data (`waktu_selesai` - `waktu_mulai`).
+    3.  $L_s$ (Jumlah di Sistem): Dihitung menggunakan **Hukum Little (**$L_s = \lambda \times W_s$). Hukum ini adalah teorema universal yang berlaku *terlepas* dari jumlah server ($s$) atau distribusi layanan ($\mu$).
+-   **Apa yang Kita Tidak Hitung:**
+    -   $W_q, L_q, \mu, \rho$. Metrik ini tidak dapat dihitung tanpa `waktu_mulai_dikerjakan` dan tanpa mengetahui $s$ secara pasti.
+
+------------------------------------------------------------------------
+
+## 2. Library
+
+```{r setup-libraries}
+# install.packages(c("readr", "dplyr", "lubridate", "knitr")) 
+library(readr)
+library(dplyr)
+library(lubridate)
+library(knitr)
+```
+
+------------------------------------------------------------------------
+
+## 3. Pemuatan dan Pra-pemrosesan Data
+
+### 3.1. Load Data Mentah
+
+```{r load-data}
+file_mentah <- "Copy of req_helpdesk_08-10(1).csv"
+df <- read_csv(file_mentah, show_col_types = TRUE)
+head(df)
+
+# Jumlah tiket per layanan (Data Mentah)
+print("Jumlah Tiket Awal per Layanan:")
+print(df %>% count(nama_layanan))
+```
+
+Karena kolom waktu_mulai waktu_selesai masih dalam tipe data character (chr), maka harus dilakukannya perubahan tipe data pada 2 kolom tersebut menjadi 'datetime'
+
+### 3.2. Membersihkan Data (Cleaning)
+
+Kita harus membersihkan data sebelum analisis.
+
+```{r clean-data}
+baris_awal <- nrow(df)
+
+df_clean <- df %>%
+    # Konversi kolom waktu ke format datetime agar bisa dihitung selisihnya
+    mutate(
+        waktu_mulai = ymd_hms(waktu_mulai, quiet = TRUE),
+        waktu_selesai = ymd_hms(waktu_selesai, quiet = TRUE)
+    ) %>%
+    # Hapus data tiket yang belum selesai atau format tanggal error
+    filter(
+        !is.na(waktu_mulai), 
+        !is.na(waktu_selesai)
+    ) %>%
+    # Hapus data anomali dimana waktu selesai mendahului waktu mulai
+    filter(waktu_selesai > waktu_mulai)
+
+baris_akhir <- nrow(df_clean)
+
+print(paste("Baris data awal:", baris_awal))
+print(paste("Baris data bersih:", baris_akhir))
+
+# Menampilkan jumlah tiket per layanan (Setelah Cleaning)
+print("Jumlah Tiket Bersih per Layanan:")
+print(df_clean %>% count(nama_layanan))
+```
+
+```{r}
+# Jumlah tiket per layanan (Data Bersih)
+print("Jumlah Tiket Awal per Layanan:")
+print(df_clean %>% count(nama_layanan))
+```
+
+Kita mulai dengan 766 tiket dan, setelah membersihkan data yang tidak lengkap atau tidak logis, kita memiliki 740 tiket yang valid untuk dianalisis.
+
+------------------------------------------------------------------------
+
+## 4. Analisis Model (Step-by-Step)
+
+Sebagai contoh perhitungan, kita akan menganalisis **Layanan E-Learning** terlebih dahulu. Langkah ini menjabarkan bagaimana metrik antrean diturunkan dari data mentah.
+
+### 4.1. Isolasi Data untuk Satu Layanan
+
+Data difilter khusus untuk layanan E-Learning dan diurutkan berdasarkan waktu kedatangan. Pengurutan ini krusial karena perhitungan interval kedatangan bergantung pada selisih waktu antar baris yang berurutan.
+
+```{r isolate-service}
+service_name <- "Layanan E-Learning"
+
+df_service <- df_clean %>%
+    filter(nama_layanan == service_name) %>%
+    arrange(waktu_mulai) 
+
+print(paste("Analisis:", service_name))
+print(paste("Jumlah tiket:", nrow(df_service)))
+```
+
+### 4.2. Perhitungan $\lambda$ (Tingkat Kedatangan)
+
+Tingkat kedatangan $\lambda$ tidak tersedia langsung di data, melainkan diturunkan dari *Inter-Arrival Time* (IAT).
+
+Prinsip perhitungannya sederhana:
+
+1.  **Hitung IAT:** Selisih waktu antara tiket saat ini dengan tiket sebelumnya $t_n - t_{n-1}$.
+
+2.  **Inversi:** $\lambda$ adalah kebalikan dari rata-rata IAT $\lambda = 1 / \text{IAT}$. Jika tiket masuk setiap 2 jam, maka kecepatannya adalah 0.5 tiket/jam.
+
+```{r calculate-lambda}
+# 1. Hitung IAT: Selisih waktu_mulai baris ini dengan baris sebelumnya 
+df_service_iat <- df_service %>%
+    mutate(iat_hours = as.numeric(difftime(waktu_mulai, lag(waktu_mulai), units = "hours")))
+
+# 2. Hitung rata-rata IAT (na.rm = TRUE untuk mengabaikan baris pertama yang NA)
+avg_iat <- mean(df_service_iat$iat_hours, na.rm = TRUE)
+
+# 3. Konversi ke Rate (Lambda)
+avg_lambda <- 1 / avg_iat
+
+print(paste("Rata-rata IAT:", round(avg_iat, 4), "jam (waktu antar tiket)"))
+print(paste("Lambda Observasi:", round(avg_lambda, 4), "tiket/jam (kecepatan masuk)"))
+```
+
+Hasil menunjukkan tiket baru masuk rata-rata setiap 5.6 jam, yang setara dengan kecepatan kedatangan 0.1777 tiket per jam.
+
+### 4.3. Perhitungan $W_s$ (Waktu Sistem)
+
+$W_s$ merepresentasikan total waktu siklus hidup tiket, mencakup waktu antre dan pengerjaan. Metrik ini dihitung langsung dari pengurangan `waktu_selesai` dengan `waktu_mulai`.
+
+```{r calculate-ws}
+# Hitung durasi total (Selesai - Mulai) untuk setiap tiket
+df_service_ws <- df_service %>%
+    mutate(ws_hours = as.numeric(difftime(waktu_selesai, waktu_mulai, units = "hours")))
+
+# Ambil rata-rata dari seluruh tiket
+avg_Ws_observed <- mean(df_service_ws$ws_hours, na.rm = TRUE)
+
+print(paste("Rata-rata Ws:", round(avg_Ws_observed, 4), "jam"))
+```
+
+Rata-rata pengguna E-Learning menunggu total 13.1 jam hingga masalah mereka tuntas.
+
+### 4.4. Perhitungan $L_s$ (Jumlah Tiket di Sistem)
+
+Dikarenakan tidak adanya data historis mengenai jumlah antrean fisik per jam, nilai \$L_s\$ dihitung secara teoritis menggunakan **Hukum Little**:
+
+$L_s = \lambda \times W_s$.
+
+Hukum ini menyatakan bahwa dalam kondisi stabil, jumlah rata-rata pelanggan dalam sistem setara dengan kecepatan kedatangan dikalikan waktu tunggu mereka.
+
+```{r calculate-ls}
+# Kalkulasi menggunakan Hukum Little
+avg_Ls_calculated <- avg_lambda * avg_Ws_observed
+
+print(paste("Ls Kalkulasi:", round(avg_Ls_calculated, 4), "tiket"))
+
+```
+
+Hasil 2.33 tiket berarti secara rata-rata terdapat sekitar 2 hingga 3 tiket yang sedang aktif (mengantre atau dikerjakan) pada satu waktu.
+
+------------------------------------------------------------------------
+
+## 5. Analisis Komparatif (Semua Layanan)
+
+Sekarang kita terapkan logika 3 langkah yang aman ini ke semua 5 layanan sekaligus.
+
+```{r run-all-services}
+final_results <- df_clean %>%
+    arrange(nama_layanan, waktu_mulai) %>%
+    group_by(nama_layanan) %>%
+    mutate(
+        iat_hours = as.numeric(difftime(waktu_mulai, lag(waktu_mulai), units = "hours")),
+        ws_hours = as.numeric(difftime(waktu_selesai, waktu_mulai, units = "hours"))
+    ) %>%
+    summarize(
+        N = n(),
+        avg_iat = mean(iat_hours, na.rm = TRUE),
+        avg_Ws_observed = mean(ws_hours, na.rm = TRUE)
+    ) %>%
+    filter(N > 1, !is.na(avg_iat), avg_iat > 0) %>%
+    
+    # Perhitungan metrik antrean
+    mutate(
+        lambda = 1 / avg_iat,
+        Ws_observed_fact = avg_Ws_observed,
+        Ls_calculated = lambda * Ws_observed_fact
+    ) %>%
+    select(
+        `Nama Layanan` = nama_layanan,
+        N,
+        `λ (Tiket/Jam)` = lambda,
+        `Ws (Jam)` = Ws_observed_fact,
+        `Ls (Tiket)` = Ls_calculated
+    ) %>%
+    arrange(desc(`Ls (Tiket)`))
+
+
+```
+
+------------------------------------------------------------------------
+
+## 6. Hasil Akhir dan Interpretasi
+
+```{r}
+# Tampilkan tabel hasil akhir
+kable(
+  final_results, 
+  digits = 3,
+  caption = "Tabel Perbandingan Kinerja Observasional (Bebas Asumsi Model)"
+)
+```
+
+### Interpretasi Singkat
+
+Dari tabel di atas, terdapat dua pola utama yang menjadi temuan kinerja:
+
+1.  **Isu Volume pada Layanan E-Learning** Layanan ini memiliki nilai $L_s$ tertinggi yaitu 2.329 tiket. Hal ini didorong oleh tingkat kedatangan $\lambda$ yang sangat tinggi mencapai 0.178 tiket/jam. Meskipun waktu penyelesaian $W_s$ relatif cepat (13.1 jam), volume yang besar menyebabkan penumpukan tiket dalam sistem.
+
+2.  **Isu Durasi pada Layanan SSO** Layanan SSO mencatat waktu penyelesaian $W_s$ terlama, yaitu 50.5 jam, meskipun tingkat kedatangannya rendah (0.021 tiket/jam). Hal ini mengindikasikan bahwa hambatan utama bukan pada jumlah permintaan, melainkan pada kompleksitas atau efisiensi proses pengerjaan per tiketnya.
+
+------------------------------------------------------------------------
+
+```{r}
+# 1. Plot Waktu Sistem (Ws) - Indikator Durasi Tunggu
+p1 <- ggplot(final_results, aes(x = reorder(`Nama Layanan`, `Ws (Jam)`), y = `Ws (Jam)`)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "Perbandingan Waktu Sistem (Ws)",
+    subtitle = "Semakin panjang bar, semakin lama user menunggu",
+    x = "",
+    y = "Waktu (Jam)"
+  ) +
+  theme_minimal()
+
+# 2. Plot Jumlah Tiket (Ls) - Indikator Kepadatan Sistem
+p2 <- ggplot(final_results, aes(x = reorder(`Nama Layanan`, `Ls (Tiket)`), y = `Ls (Tiket)`)) +
+  geom_bar(stat = "identity", fill = "firebrick") +
+  coord_flip() +
+  labs(
+    title = "Perbandingan Kepadatan Sistem (Ls)",
+    subtitle = "Semakin panjang bar, semakin banyak tumpukan tiket",
+    x = "",
+    y = "Jumlah Tiket"
+  ) +
+  theme_minimal()
+
+print(p1)
+print(p2)
+```
